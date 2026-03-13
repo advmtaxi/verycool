@@ -272,55 +272,51 @@ def _is_m3u8_line(line: str) -> bool:
 
 
 def _rewrite_m3u8(content: str, base_url: str, key: str) -> str:
-    """
-    Rewrite a playlist so that:
-      - Sub-playlists (variants, chunkists) → /proxy?link=…&_variant=…
-      - AES key URIs                        → /proxy?link=…&_key=…
-      - Segments (any extension, incl .png) → direct CDN URL (no hop through HF)
-    """
     parsed    = urlparse(base_url)
     base_host = f"{parsed.scheme}://{parsed.netloc}"
     base_path = os.path.dirname(parsed.path)
 
     def resolve(u: str) -> str:
-        if u.startswith("http"):
-            return u
-        if u.startswith("//"):
-            return parsed.scheme + ":" + u
-        if u.startswith("/"):
-            return base_host + u
+        if u.startswith("http"): return u
+        if u.startswith("//"):   return parsed.scheme + ":" + u
+        if u.startswith("/"):    return base_host + u
         return f"{base_host}{base_path}/{u}"
 
     lines = []
+    next_is_variant = False  # set True after #EXT-X-STREAM-INF
+
     for raw in content.splitlines():
         line = raw.strip()
         if not line:
             continue
 
         if line.startswith("#"):
-            # Rewrite URI= attributes (e.g. #EXT-X-KEY, #EXT-X-MAP)
+            if line.startswith(("#EXT-X-STREAM-INF", "#EXT-X-I-FRAME-STREAM-INF")):
+                next_is_variant = True
+
             if 'URI="' in line:
                 def _rewrite_uri(m):
-                    uri = m.group(1)
+                    uri      = m.group(1)
                     resolved = resolve(uri)
-                    # AES key: always proxy through browser
-                    if 'key' in uri.lower() or not _is_m3u8_line(uri):
-                        proxy_url = f'{PROXY_HOST}/proxy?link={quote(key)}&_key={quote(resolved)}'
-                    else:
-                        proxy_url = f'{PROXY_HOST}/proxy?link={quote(key)}&_variant={quote(resolved)}'
-                    return f'URI="{proxy_url}"'
+                    # AES key → key proxy, everything else with URI= → variant
+                    if 'key' in uri.lower() and not uri.lower().endswith('.m3u8'):
+                        return f'URI="{PROXY_HOST}/proxy?link={quote(key)}&_key={quote(resolved)}"'
+                    return f'URI="{PROXY_HOST}/proxy?link={quote(key)}&_variant={quote(resolved)}"'
                 line = re.sub(r'URI="(.*?)"', _rewrite_uri, line)
+
             lines.append(line)
 
-        elif _is_m3u8_line(line):
-            # Sub-playlist (variant, chunklist, mono.ts.m3u8, etc.)
-            # Must be fetched through the browser so Origin/Referer are correct
+        elif next_is_variant or ".m3u8" in line.lower():
+            # Sub-playlist (variant / chunklist / mono.ts.m3u8)
+            # Must go through browser so Origin/Referer/cookies are correct
+            next_is_variant = False
             resolved = resolve(line)
             lines.append(f"{PROXY_HOST}/proxy?link={quote(key)}&_variant={quote(resolved)}")
 
         else:
-            # Media segment — any extension (.ts, .aac, .png, .jpg, signed S3 URLs, …)
-            # These are served directly from CDN; no need to bounce through HF.
+            # Raw segment (.ts, .aac, .png, signed S3, etc.)
+            # Player fetches this DIRECTLY from the CDN — no hop through us
+            next_is_variant = False
             lines.append(resolve(line))
 
     return "\n".join(lines)
