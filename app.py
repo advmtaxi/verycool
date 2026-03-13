@@ -17,7 +17,7 @@ print("[INIT] Chromium ready")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 PORT       = int(os.environ.get("PORT", 7860))
-PROXY_HOST = "https://notgoodman-verycoolman.hf.space/"
+PROXY_HOST = "https://notgoodman-verycoolman.hf.space"
 
 IDLE_TIMEOUT = 45  # seconds of no playlist requests before we kill the browser
 
