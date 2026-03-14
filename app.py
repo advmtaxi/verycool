@@ -1,18 +1,16 @@
-print("New App.py Loaded v3.")
-import subprocess, sys
+print("New App.py Loaded v4.")
+import subprocess
+import sys
 
-# ── Ensure dependencies are installed ───────────────────────────────────────
-subprocess.run([sys.executable, "-m", "pip", "install", "requests", "playwright", "curl_cffi", "flask", "gunicorn"], check=True)
+# ── Ensure dependencies ──────────────────────────────────────────────────────
+subprocess.run([sys.executable, "-m", "pip", "install", "requests", "playwright", "curl_cffi"], check=True)
 
-import requests as req_lib
-# ... rest of imports
 import asyncio
 import threading
 import time
 import re
 import os
 import logging
-import subprocess
 import base64
 from curl_cffi import requests as req_lib
 from flask import Flask, jsonify, Response, request, redirect
@@ -27,7 +25,7 @@ print("[INIT] Chromium ready")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 PORT         = int(os.environ.get("PORT", 7860))
-IDLE_TIMEOUT = 300   # 5 min idle before evicting a session (no playlist request)
+IDLE_TIMEOUT = 300   # 5 min idle before evicting a session
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -46,26 +44,27 @@ def run_async(coro, timeout=30):
     return fut.result(timeout=timeout)
 
 # ── Storage ──────────────────────────────────────────────────────────────────
-stream_cache    = {}   # embed_url → entry dict
+stream_cache    = {}
 cache_lock      = threading.Lock()
 active_sniffers = set()
 
 # =============================================================================
-# HELPERS — dynamic host + requests session
+# HELPERS
 # =============================================================================
 
 def get_proxy_host():
-    """
-    Auto-detect our own public base URL from incoming request headers.
-    Works on HuggingFace Spaces, Railway, Render, bare VPS — no hard-coded URL.
-    """
+    """Auto-detect our own public base URL from incoming request headers."""
     scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
     host   = request.headers.get("X-Forwarded-Host", request.host)
     return f"{scheme}://{host}"
 
 
 def _make_session(captured_headers: dict, captured_cookies: dict) -> req_lib.Session:
-    s = req_lib.Session(impersonate="chrome124")  # ← this is the key line
+    """
+    Build a curl_cffi Session that impersonates Chrome's TLS fingerprint.
+    Copies the exact headers the browser sent so the CDN accepts us.
+    """
+    s = req_lib.Session(impersonate="chrome124")
 
     KEEP = {"referer", "origin", "user-agent", "accept", "accept-language"}
     for k, v in captured_headers.items():
@@ -84,7 +83,7 @@ def _make_session(captured_headers: dict, captured_cookies: dict) -> req_lib.Ses
 
 
 def _fetch_text(embed_url: str, url: str) -> str | None:
-    """Fetch URL as text using the session captured during sniff."""
+    """Fetch URL as text using the captured curl_cffi session."""
     entry = _get_cached(embed_url)
     if not entry:
         return None
@@ -111,43 +110,6 @@ def _fetch_binary(embed_url: str, url: str) -> bytes | None:
         return None
 
 
-def _segments_alive(embed_url: str, playlist_body: str, base_url: str) -> bool:
-    """
-    HEAD-check the first .ts segment in a chunklist.
-    Returns False if the segment is gone (expired CDN link), True otherwise.
-    """
-    entry = _get_cached(embed_url)
-    if not entry:
-        return False
-
-    parsed    = urlparse(base_url)
-    base_host = f"{parsed.scheme}://{parsed.netloc}"
-    base_path = os.path.dirname(parsed.path)
-
-    def resolve(u):
-        if u.startswith("http"): return u
-        if u.startswith("//"):   return parsed.scheme + ":" + u
-        if u.startswith("/"):    return base_host + u
-        return f"{base_host}{base_path}/{u}"
-
-    for line in playlist_body.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        # First non-comment line is a segment
-        seg_url = resolve(line)
-        try:
-            r = entry["session"].head(seg_url, timeout=5, allow_redirects=True)
-            alive = r.status_code < 400
-            logger.info(f"[SEGMENTS] HEAD {r.status_code} → {'alive' if alive else 'EXPIRED'}: {seg_url[:80]}")
-            return alive
-        except Exception as e:
-            logger.warning(f"[SEGMENTS] HEAD error: {e}")
-            return False
-
-    return True  # no segments found → assume alive (master playlist)
-
-
 def _get_cached(key: str) -> dict | None:
     with cache_lock:
         c = stream_cache.get(key)
@@ -158,20 +120,17 @@ def _get_cached(key: str) -> dict | None:
 
 def _touch(key: str):
     """
-    Mark the stream as recently accessed.
-    Extends expiry by 3 h from now so long matches never auto-evict while active.
+    Mark stream as recently accessed.
+    Extends expiry by 3 hours rolling so long matches never auto-evict.
     """
     with cache_lock:
         if key in stream_cache:
             stream_cache[key]["last_accessed"] = time.time()
-            stream_cache[key]["expires"]        = time.time() + 10_800  # 3 h rolling
+            stream_cache[key]["expires"]        = time.time() + 10_800  # 3h rolling
 
 
 def _get_fresh_master(embed_url: str, cached: dict) -> str | None:
-    """
-    Re-fetch the master playlist via requests. Rate-limited to once per 2 s.
-    Falls back to cached body if fetch fails.
-    """
+    """Re-fetch the master playlist via requests. Rate-limited to once per 2s."""
     now  = time.time()
     last = cached.get("body_ts", 0)
 
@@ -197,12 +156,11 @@ def _get_fresh_master(embed_url: str, cached: dict) -> str | None:
 def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) -> str:
     """
     Rewrite a playlist so that:
-      - Sub-playlists (variant / chunklist) are routed through our /proxy
-        so the CDN gets the right Origin/Referer/cookies.
-      - AES-128 keys are routed through /proxy?_key=... for the same reason.
-      - Raw .ts segments are left as absolute CDN URLs — player fetches them directly.
-      - #EXT-X-PLAYLIST-TYPE:EVENT is injected so players keep all segments
-        in their buffer (enables rewind) but still start at the live edge.
+      - Sub-playlists (variant/chunklist) go through /proxy so CDN gets correct headers.
+      - AES-128 keys go through /proxy?_key=...
+      - Raw .ts segments are left as absolute CDN URLs — player fetches directly.
+      - #EXT-X-PLAYLIST-TYPE:EVENT injected so players buffer all segments
+        (enables rewind to start of session) but still begin at the live edge.
     """
     parsed    = urlparse(base_url)
     base_host = f"{parsed.scheme}://{parsed.netloc}"
@@ -214,41 +172,37 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
         if u.startswith("/"):    return base_host + u
         return f"{base_host}{base_path}/{u}"
 
-    lines               = []
-    header_injected     = False
-    next_is_variant     = False
+    lines           = []
+    header_injected = False
+    next_is_variant = False
 
     for raw in content.splitlines():
         line = raw.strip()
         if not line:
             continue
 
-        # ── After #EXTM3U inject EVENT type so players buffer all segments ──
+        # Inject EVENT type after #EXTM3U so players keep all segments in buffer
         if line == "#EXTM3U" and not header_injected:
             lines.append(line)
             lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
             header_injected = True
             continue
 
-        # Override any LIVE/VOD type the source sends — we always want EVENT
+        # Always override source playlist type to EVENT
         if line.startswith("#EXT-X-PLAYLIST-TYPE"):
             lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
             continue
 
         if line.startswith("#"):
-            # Flag that the next URI line is a variant stream
             if line.startswith(("#EXT-X-STREAM-INF", "#EXT-X-I-FRAME-STREAM-INF")):
                 next_is_variant = True
 
-            # Rewrite URI="..." inside tags (keys, alternate renditions, etc.)
             if 'URI="' in line:
                 def _rewrite_uri(m):
                     uri      = m.group(1)
                     resolved = resolve(uri)
-                    # AES key (contains "key" but not a sub-playlist)
                     if "key" in uri.lower() and not uri.lower().endswith(".m3u8"):
                         return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_key={quote(resolved)}"'
-                    # Sub-playlist referenced inline
                     return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}"'
                 line = re.sub(r'URI="(.*?)"', _rewrite_uri, line)
 
@@ -261,7 +215,7 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
             lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
 
         else:
-            # Raw segment (.ts, .aac, signed S3, etc.) → absolute CDN URL, player fetches directly
+            # Raw segment (.ts etc.) → absolute CDN URL, player fetches directly
             next_is_variant = False
             lines.append(resolve(line))
 
@@ -347,19 +301,6 @@ def proxy():
             logger.warning(f"[VARIANT] Bad/empty body for {variant_url[:80]}")
             return Response("Variant fetch failed", status=503)
 
-        # Check if segments are still alive on the CDN
-        if not _segments_alive(embed_url, body, variant_url):
-            logger.warning(f"[VARIANT] Segments expired — triggering re-sniff")
-            # Evict the stale session and kick off a fresh sniff
-            with cache_lock:
-                stream_cache.pop(embed_url, None)
-            _ensure_sniffer(embed_url)
-            return Response(
-                "Stream segments have expired. The source URL has rotated — "
-                "please reload the player in a few seconds.",
-                status=410,
-            )
-
         rewritten = _rewrite_m3u8(body, variant_url, embed_url, proxy_host)
         return Response(
             rewritten,
@@ -414,9 +355,8 @@ def extract():
     return jsonify({"success": False, "error": "timeout"}), 202
 
 # =============================================================================
-# SNIFFER  — Chromium is used ONLY to find the m3u8 URL + capture headers/cookies.
-#            The browser is closed immediately after. All subsequent fetches
-#            go through a plain requests.Session — no browser stays alive.
+# SNIFFER — Chromium opens, finds the m3u8, captures headers + cookies,
+#           then closes immediately. All future fetches use curl_cffi.
 # =============================================================================
 
 def _ensure_sniffer(embed_url: str):
@@ -469,7 +409,6 @@ async def _sniff(embed_url: str):
             try:
                 body = await resp.text()
                 if "#EXTM3U" in body:
-                    # Capture the exact request headers the browser sent
                     req_headers = await resp.request.all_headers()
                     logger.info(f"[SNIFF] ✅ Playlist found: {u}")
                     found["url"]     = u
@@ -483,14 +422,12 @@ async def _sniff(embed_url: str):
 
     try:
         await page.goto(target, timeout=20_000, wait_until="domcontentloaded")
-        # Try to click play button if it appears
         try:
             btn = page.locator(".clappr-big-play-button")
             if await btn.is_visible():
                 await btn.click(timeout=1_000)
         except Exception:
             pass
-        # Wait up to 15 s for the network intercept to fire
         for _ in range(15):
             if found:
                 break
@@ -499,11 +436,9 @@ async def _sniff(embed_url: str):
         logger.error(f"[SNIFF] Navigation error: {e}")
 
     if found:
-        # Grab browser cookies before we close everything
         cookies     = await context.cookies()
         cookie_dict = {c["name"]: c["value"] for c in cookies}
-
-        session = _make_session(found.get("headers", {}), cookie_dict)
+        session     = _make_session(found.get("headers", {}), cookie_dict)
 
         with cache_lock:
             stream_cache[embed_url] = {
@@ -512,14 +447,13 @@ async def _sniff(embed_url: str):
                 "body_ts":       time.time(),
                 "last_accessed": time.time(),
                 "session":       session,
-                # Rolling 3-hour expiry — extended by _touch() on each playlist request
-                "expires":       time.time() + 10_800,
+                "expires":       time.time() + 10_800,  # 3h rolling, extended by _touch()
             }
         logger.info("[SNIFF] ✅ Session cached. Closing browser now.")
     else:
         logger.error("[SNIFF] ❌ No m3u8 found within timeout")
 
-    # ── Always close Chromium — we don't need it anymore ──────────────────────
+    # Always close Chromium — we don't need it anymore
     try:
         await browser.close()
     except Exception:
@@ -532,11 +466,11 @@ async def _sniff(embed_url: str):
     active_sniffers.discard(embed_url)
 
 # =============================================================================
-# CLEANUP — evict idle/expired sessions (no browsers to close, just dicts)
+# CLEANUP — evict idle/expired sessions
 # =============================================================================
 
 def _cleanup_loop():
-    """Runs every 30 s. Evicts sessions that are expired or have gone idle."""
+    """Runs every 30s. Evicts sessions that are expired or gone idle."""
     while True:
         time.sleep(30)
         try:
@@ -557,7 +491,6 @@ def _cleanup_loop():
                         if entry["expires"] < now
                         else f"idle {idle_s:.0f}s"
                     )
-                    # Close the requests session cleanly
                     try:
                         entry["session"].close()
                     except Exception:
@@ -565,7 +498,6 @@ def _cleanup_loop():
                     logger.info(f"[CLEANUP] Evicted ({reason}): {k[:70]}")
         except Exception as e:
             logger.warning(f"[CLEANUP] Error: {e}")
-
 
 # =============================================================================
 # ENTRY POINT
