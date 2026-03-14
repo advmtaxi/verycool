@@ -2,7 +2,7 @@ print("New App.py Loaded v3.")
 import subprocess, sys
 
 # ── Ensure dependencies are installed ───────────────────────────────────────
-subprocess.run([sys.executable, "-m", "pip", "install", "requests", "playwright"], check=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "requests", "playwright", "curl_cffi", "flask", "gunicorn"], check=True)
 
 import requests as req_lib
 # ... rest of imports
