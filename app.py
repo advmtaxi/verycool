@@ -14,7 +14,7 @@ import os
 import logging
 import subprocess
 import base64
-import requests as req_lib
+from curl_cffi import requests as req_lib
 from flask import Flask, jsonify, Response, request, redirect
 from playwright.async_api import async_playwright
 from urllib.parse import quote, urlparse
@@ -65,19 +65,13 @@ def get_proxy_host():
 
 
 def _make_session(captured_headers: dict, captured_cookies: dict) -> req_lib.Session:
-    """
-    Build a requests.Session that mimics the browser that found the m3u8.
-    Only pass headers the CDN cares about — don't leak internal browser internals.
-    """
-    s = req_lib.Session()
+    s = req_lib.Session(impersonate="chrome124")  # ← this is the key line
 
-    # Headers we want to preserve from the original browser request
-    KEEP = {"referer", "origin", "user-agent", "accept", "accept-language", "accept-encoding"}
+    KEEP = {"referer", "origin", "user-agent", "accept", "accept-language"}
     for k, v in captured_headers.items():
         if k.lower() in KEEP:
             s.headers[k] = v
 
-    # Sane defaults if the browser request didn't include them
     s.headers.setdefault(
         "User-Agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -85,7 +79,6 @@ def _make_session(captured_headers: dict, captured_cookies: dict) -> req_lib.Ses
     )
     s.headers.setdefault("Accept", "*/*")
     s.headers.setdefault("Accept-Language", "en-US,en;q=0.9")
-    s.headers.setdefault("Accept-Encoding", "gzip, deflate, br")
     s.cookies.update(captured_cookies)
     return s
 
