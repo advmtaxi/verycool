@@ -13,7 +13,6 @@ def install_deps():
         print("[INIT] Installing missing dependencies...")
         subprocess.run([sys.executable, "-m", "pip", "install", "flask", "requests", "playwright", "curl_cffi"], check=True)
     
-    # Ensure playwright browsers are installed
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
     except Exception as e:
@@ -22,7 +21,6 @@ def install_deps():
 if __name__ == "__main__" or __name__ == "app":
     install_deps()
 
-# ── Now safe to import everything else ───────────────────────────────────────
 import asyncio
 import threading
 import time
@@ -33,11 +31,11 @@ from flask import Flask, jsonify, Response, request, redirect
 from playwright.async_api import async_playwright
 from urllib.parse import quote, urlparse, urljoin
 
-print("New App.py Loaded v6 - Dependency Fix & Master M3U8")
+print("New App.py Loaded v7 - HD Priority & Robust Sniffer")
 
 # ── Config ───────────────────────────────────────────────────────────────────
 PORT         = int(os.environ.get("PORT", 7860))
-IDLE_TIMEOUT = 600   # 10 min idle before evicting a session
+IDLE_TIMEOUT = 600
 REFERERS     = ["https://embedsports.top/", "https://streamed.pk/"]
 ORIGINS      = ["https://embedsports.top", "https://streamed.pk"]
 
@@ -46,14 +44,12 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Persistent asyncio event loop ───────────────────────────────────────────
 _loop = asyncio.new_event_loop()
 def _start_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 threading.Thread(target=_start_loop, args=(_loop,), daemon=True).start()
 
-# ── Storage ──────────────────────────────────────────────────────────────────
 stream_cache    = {}
 cache_lock      = threading.Lock()
 active_sniffers = {}
@@ -130,6 +126,41 @@ def _rewrite_m3u8(content: str, playlist_url: str, embed_key: str, proxy_host: s
     def resolve(u: str) -> str:
         return urljoin(base_url, u) if not u.startswith("http") else u
 
+    # Check if it's a master playlist with multiple qualities
+    is_master = "#EXT-X-STREAM-INF" in content
+    
+    if is_master:
+        # Prioritize HD (1080p, 720p)
+        variants = []
+        current_inf = None
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line: continue
+            if line.startswith("#EXT-X-STREAM-INF"):
+                current_inf = line
+            elif not line.startswith("#"):
+                if current_inf:
+                    variants.append((current_inf, line))
+                    current_inf = None
+        
+        # Sort variants by resolution/bandwidth (highest first)
+        def get_quality(v):
+            inf = v[0]
+            res = re.search(r'RESOLUTION=(\d+)x(\d+)', inf)
+            if res: return int(res.group(1)) * int(res.group(2))
+            bw = re.search(r'BANDWIDTH=(\d+)', inf)
+            if bw: return int(bw.group(1))
+            return 0
+        
+        variants.sort(key=get_quality, reverse=True)
+        
+        lines.append("#EXTM3U")
+        for inf, url in variants:
+            lines.append(inf)
+            lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_url={quote(resolve(url))}")
+        return "\n".join(lines)
+
+    # Media playlist (segments)
     for raw in content.splitlines():
         line = raw.strip()
         if not line: continue
@@ -202,30 +233,55 @@ async def _sniff(embed_url: str):
             browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             page = await context.new_page()
-            await page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}", lambda route: route.abort())
-
+            
+            # Capture all m3u8 requests
             async def on_response(resp):
-                if not found and ".m3u8" in resp.url and resp.status == 200:
+                if ".m3u8" in resp.url and resp.status == 200:
                     try:
                         text = await resp.text()
                         if "#EXTM3U" in text:
-                            found.update({"url": resp.url, "body": text, "headers": await resp.request.all_headers(), "cookies": await context.cookies()})
+                            # If it's a master playlist, we definitely want it
+                            if "#EXT-X-STREAM-INF" in text or not found:
+                                found.update({
+                                    "url": resp.url, 
+                                    "body": text, 
+                                    "headers": await resp.request.all_headers(), 
+                                    "cookies": await context.cookies()
+                                })
+                                logger.info(f"[SNIFF] Found m3u8: {resp.url}")
                     except: pass
+            
             page.on("response", on_response)
-            await page.goto(embed_url, timeout=30000, wait_until="commit")
-            for _ in range(10):
-                if found: break
+            
+            # Navigate and wait
+            await page.goto(embed_url, timeout=45000, wait_until="networkidle")
+            
+            # Try to trigger playback
+            for _ in range(15):
+                if found and "#EXT-X-STREAM-INF" in found["body"]: break
                 await asyncio.sleep(1)
                 try:
-                    btn = page.locator(".clappr-big-play-button, .vjs-big-play-button, button[class*='play']").first
-                    if await btn.is_visible(): await btn.click()
+                    # Click anything that looks like a play button
+                    for selector in [".clappr-big-play-button", ".vjs-big-play-button", "button[class*='play']", "div[class*='play']"]:
+                        btn = page.locator(selector).first
+                        if await btn.is_visible(): 
+                            await btn.click()
+                            break
                 except: pass
+            
             await browser.close()
         except Exception as e: logger.error(f"Sniff error: {e}")
 
     if found:
         with cache_lock:
-            stream_cache[embed_url] = {"url": found["url"], "body": found["body"], "body_ts": time.time(), "session": _make_session(found["headers"], {c["name"]: c["value"] for c in found["cookies"]}), "expires": time.time() + 10800, "last_accessed": time.time()}
+            stream_cache[embed_url] = {
+                "url": found["url"], 
+                "body": found["body"], 
+                "body_ts": time.time(), 
+                "session": _make_session(found["headers"], {c["name"]: c["value"] for c in found["cookies"]}), 
+                "expires": time.time() + 10800, 
+                "last_accessed": time.time()
+            }
     with cache_lock: active_sniffers.pop(embed_url, None)
 
 # =============================================================================
