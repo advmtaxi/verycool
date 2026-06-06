@@ -1,8 +1,7 @@
-print("New App.py Loaded v4.")
+print("New App.py Loaded v5.")
 import subprocess
 import sys
 
-# ── Ensure dependencies ──────────────────────────────────────────────────────
 subprocess.run([sys.executable, "-m", "pip", "install", "requests", "playwright", "curl_cffi"], check=True)
 
 import asyncio
@@ -17,22 +16,19 @@ from flask import Flask, jsonify, Response, request, redirect
 from playwright.async_api import async_playwright
 from urllib.parse import quote, urlparse
 
-# ── Install Chromium on startup ──────────────────────────────────────────────
 print("[INIT] Installing Chromium...")
 subprocess.run(["playwright", "install", "chromium"], check=True)
 subprocess.run(["playwright", "install-deps", "chromium"], check=True)
 print("[INIT] Chromium ready")
 
-# ── Config ───────────────────────────────────────────────────────────────────
 PORT         = int(os.environ.get("PORT", 7860))
-IDLE_TIMEOUT = 300   # 5 min idle before evicting a session
+IDLE_TIMEOUT = 300
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ── Persistent asyncio event loop (for Playwright sniffs) ────────────────────
 _loop = asyncio.new_event_loop()
 def _start_loop(loop):
     asyncio.set_event_loop(loop)
@@ -43,7 +39,6 @@ def run_async(coro, timeout=30):
     fut = asyncio.run_coroutine_threadsafe(coro, _loop)
     return fut.result(timeout=timeout)
 
-# ── Storage ──────────────────────────────────────────────────────────────────
 stream_cache    = {}
 cache_lock      = threading.Lock()
 active_sniffers = set()
@@ -53,17 +48,12 @@ active_sniffers = set()
 # =============================================================================
 
 def get_proxy_host():
-    """Auto-detect our own public base URL from incoming request headers."""
     scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
     host   = request.headers.get("X-Forwarded-Host", request.host)
     return f"{scheme}://{host}"
 
 
 def _make_session(captured_headers: dict, captured_cookies: dict) -> req_lib.Session:
-    """
-    Build a curl_cffi Session that impersonates Chrome's TLS fingerprint.
-    Copies the exact headers the browser sent so the CDN accepts us.
-    """
     s = req_lib.Session(impersonate="chrome124")
 
     KEEP = {"referer", "origin", "user-agent", "accept", "accept-language"}
@@ -83,12 +73,13 @@ def _make_session(captured_headers: dict, captured_cookies: dict) -> req_lib.Ses
 
 
 def _fetch_text(embed_url: str, url: str) -> str | None:
-    """Fetch URL as text using the captured curl_cffi session."""
     entry = _get_cached(embed_url)
     if not entry:
+        logger.warning(f"[FETCH TEXT] No cached session for {embed_url[:80]}")
         return None
     try:
         r = entry["session"].get(url, timeout=10)
+        logger.info(f"[FETCH TEXT] {r.status_code} {url[:80]}")
         r.raise_for_status()
         return r.text
     except Exception as e:
@@ -97,7 +88,6 @@ def _fetch_text(embed_url: str, url: str) -> str | None:
 
 
 def _fetch_binary(embed_url: str, url: str) -> bytes | None:
-    """Fetch URL as bytes (e.g. AES-128 key) using the captured session."""
     entry = _get_cached(embed_url)
     if not entry:
         return None
@@ -119,18 +109,13 @@ def _get_cached(key: str) -> dict | None:
 
 
 def _touch(key: str):
-    """
-    Mark stream as recently accessed.
-    Extends expiry by 3 hours rolling so long matches never auto-evict.
-    """
     with cache_lock:
         if key in stream_cache:
             stream_cache[key]["last_accessed"] = time.time()
-            stream_cache[key]["expires"]        = time.time() + 10_800  # 3h rolling
+            stream_cache[key]["expires"]        = time.time() + 10_800
 
 
 def _get_fresh_master(embed_url: str, cached: dict) -> str | None:
-    """Re-fetch the master playlist via requests. Rate-limited to once per 2s."""
     now  = time.time()
     last = cached.get("body_ts", 0)
 
@@ -150,7 +135,9 @@ def _get_fresh_master(embed_url: str, cached: dict) -> str | None:
     return cached.get("body")
 
 # =============================================================================
-# M3U8 REWRITER
+# M3U8 REWRITER — master playlist only
+# Rewrites .m3u8 variant URLs through /proxy so they are fetched with headers.
+# Everything else (segments) is left as direct CDN URLs.
 # =============================================================================
 
 def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) -> str:
@@ -172,10 +159,6 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
         if not line:
             continue
 
-        if line.startswith("#EXT-X-PLAYLIST-TYPE"):
-            lines.append(line)
-            continue
-
         if line.startswith("#"):
             if line.startswith(("#EXT-X-STREAM-INF", "#EXT-X-I-FRAME-STREAM-INF")):
                 next_is_variant = True
@@ -184,15 +167,11 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
                 def _rewrite_uri(m):
                     uri      = m.group(1)
                     resolved = resolve(uri)
-
                     if "key" in uri.lower() and not uri.lower().endswith(".m3u8"):
                         return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_key={quote(resolved)}"'
-
                     if resolved.lower().endswith(".m3u8") or ".m3u8?" in resolved.lower():
                         return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}"'
-
                     return f'URI="{resolved}"'
-
                 line = re.sub(r'URI="(.*?)"', _rewrite_uri, line)
 
             lines.append(line)
@@ -203,11 +182,11 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
             lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
 
         else:
-            # Segment — serve directly as-is
             next_is_variant = False
             lines.append(resolve(line))
 
     return "\n".join(lines)
+
 # =============================================================================
 # CORS
 # =============================================================================
@@ -240,7 +219,6 @@ def health():
 
 @app.route("/redirect")
 def redirect_to_m3u8():
-    """302-redirect straight to the raw CDN m3u8 (no rewriting)."""
     embed_url = request.args.get("link")
     if not embed_url:
         return jsonify({"error": "missing ?link="}), 400
@@ -271,7 +249,7 @@ def proxy():
     variant_url = request.args.get("_variant")
     key_url     = request.args.get("_key")
 
-    # ── AES-128 encryption key ────────────────────────────────────────────────
+    # ── AES-128 key ───────────────────────────────────────────────────────────
     if key_url:
         key_bytes = _fetch_binary(embed_url, key_url)
         if key_bytes:
@@ -280,20 +258,32 @@ def proxy():
         return Response("Key fetch failed", status=503)
 
     # ── Variant / chunklist playlist ─────────────────────────────────────────
+    # Fetch with captured session headers, stream response raw to player as-is.
+    # _rewrite_m3u8 is NOT called here — segments inside are direct CDN URLs.
     if variant_url:
         _touch(embed_url)
-        body = _fetch_text(embed_url, variant_url)
+        entry = _get_cached(embed_url)
+        if not entry:
+            return Response("Session expired", status=503)
 
-        if not body or "#EXTM3U" not in body:
-            logger.warning(f"[VARIANT] Bad/empty body for {variant_url[:80]}")
+        try:
+            r = entry["session"].get(variant_url, stream=True, timeout=10)
+            logger.info(f"[VARIANT] {r.status_code} {variant_url[:80]}")
+
+            def generate():
+                for chunk in r.iter_content(chunk_size=65536):
+                    if chunk:
+                        yield chunk
+
+            return Response(
+                generate(),
+                status=r.status_code,
+                content_type=r.headers.get("Content-Type", "application/vnd.apple.mpegurl"),
+                headers={"Cache-Control": "no-cache, no-store"},
+            )
+        except Exception as e:
+            logger.error(f"[VARIANT] Fetch error: {e}")
             return Response("Variant fetch failed", status=503)
-
-        rewritten = _rewrite_m3u8(body, variant_url, embed_url, proxy_host)
-        return Response(
-            rewritten,
-            mimetype="application/vnd.apple.mpegurl",
-            headers={"Cache-Control": "no-cache, no-store"},
-        )
 
     # ── Master playlist ───────────────────────────────────────────────────────
     cached = _get_cached(embed_url)
@@ -342,8 +332,7 @@ def extract():
     return jsonify({"success": False, "error": "timeout"}), 202
 
 # =============================================================================
-# SNIFFER — Chromium opens, finds the m3u8, captures headers + cookies,
-#           then closes immediately. All future fetches use curl_cffi.
+# SNIFFER
 # =============================================================================
 
 def _ensure_sniffer(embed_url: str):
@@ -390,7 +379,6 @@ async def _sniff(embed_url: str):
         if found:
             return
         u = resp.url
-        # Grab master playlists only — skip chunklists / audio variants
         if ".m3u8" in u and "chunklist" not in u and "audio" not in u.lower():
             logger.info(f"[NETWORK] {resp.status} {u}")
             try:
@@ -434,13 +422,12 @@ async def _sniff(embed_url: str):
                 "body_ts":       time.time(),
                 "last_accessed": time.time(),
                 "session":       session,
-                "expires":       time.time() + 10_800,  # 3h rolling, extended by _touch()
+                "expires":       time.time() + 10_800,
             }
         logger.info("[SNIFF] ✅ Session cached. Closing browser now.")
     else:
         logger.error("[SNIFF] ❌ No m3u8 found within timeout")
 
-    # Always close Chromium — we don't need it anymore
     try:
         await browser.close()
     except Exception:
@@ -453,11 +440,10 @@ async def _sniff(embed_url: str):
     active_sniffers.discard(embed_url)
 
 # =============================================================================
-# CLEANUP — evict idle/expired sessions
+# CLEANUP
 # =============================================================================
 
 def _cleanup_loop():
-    """Runs every 30s. Evicts sessions that are expired or gone idle."""
     while True:
         time.sleep(30)
         try:
