@@ -109,12 +109,16 @@ def proxy():
     entry = _get_cached(embed_url)
     if not entry:
         _ensure_sniffer(embed_url)
-        for _ in range(60):
+        # Increase wait loop to 120 * 0.5 = 60 seconds
+        for i in range(120):
             time.sleep(0.5)
             entry = _get_cached(embed_url)
-            if entry: break
+            if entry: 
+                logger.info(f"[PROXY] Sniff finished after {i*0.5}s")
+                break
             
     if not entry:
+        logger.error(f"[PROXY] Sniff TIMEOUT for {embed_url}")
         return "Sniff timeout", 504
     
     _touch(embed_url)
@@ -179,16 +183,20 @@ async def _sniff(embed_url: str):
         page.on("response", on_response)
         
         try:
-            await page.goto(target, wait_until="networkidle", timeout=30000)
-            # Try to click play if needed
+            # Using 'domcontentloaded' is much faster than 'networkidle'
+            await page.goto(target, wait_until="domcontentloaded", timeout=20000)
+            
+            # Try to click play button immediately if it appears
             try:
-                await page.click(".clappr-big-play-button", timeout=2000)
+                play_btn = page.locator(".clappr-big-play-button")
+                if await play_btn.is_visible():
+                    await play_btn.click(timeout=1000)
             except: pass
             
-            # Wait a bit more for M3U8
-            for _ in range(20):
+            # Rapidly check for the M3U8 for up to 15 seconds
+            for _ in range(60):
                 if found: break
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.25)
         except Exception as e:
             logger.error(f"[SNIFF] Page error: {e}")
 
