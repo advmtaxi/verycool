@@ -154,15 +154,6 @@ def _get_fresh_master(embed_url: str, cached: dict) -> str | None:
 # =============================================================================
 
 def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) -> str:
-    """
-    Rewrite a playlist so that:
-      - True variant sub-playlists (from #EXT-X-STREAM-INF) → /proxy?_variant=
-      - AES-128 keys → /proxy?_key=
-      - Audio/media track URIs (#EXT-X-MEDIA URI=) → /proxy?_variant= so we can
-        fetch them with correct headers, then their .ts segments go direct
-      - All segment lines (.ts, or bare URLs that are NOT .m3u8) → absolute CDN URL
-        (player fetches directly, no proxy hop)
-    """
     parsed    = urlparse(base_url)
     base_host = f"{parsed.scheme}://{parsed.netloc}"
     base_path = os.path.dirname(parsed.path)
@@ -174,27 +165,18 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
         return f"{base_host}{base_path}/{u}"
 
     lines           = []
-    header_injected = False
-    next_is_variant = False   # set True only after #EXT-X-STREAM-INF tag
+    next_is_variant = False
 
     for raw in content.splitlines():
         line = raw.strip()
         if not line:
             continue
 
-        # Inject EVENT type after #EXTM3U
-        if line == "#EXTM3U" and not header_injected:
-            lines.append(line)
-            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
-            header_injected = True
-            continue
-
         if line.startswith("#EXT-X-PLAYLIST-TYPE"):
-            lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
+            lines.append(line)  # pass through as-is
             continue
 
         if line.startswith("#"):
-            # Only true stream/iframe variants set next_is_variant
             if line.startswith(("#EXT-X-STREAM-INF", "#EXT-X-I-FRAME-STREAM-INF")):
                 next_is_variant = True
 
@@ -203,15 +185,12 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
                     uri      = m.group(1)
                     resolved = resolve(uri)
 
-                    # AES-128 key — always proxy
                     if "key" in uri.lower() and not uri.lower().endswith(".m3u8"):
                         return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_key={quote(resolved)}"'
 
-                    # Any URI that is a .m3u8 (e.g. #EXT-X-MEDIA audio track) → proxy
                     if resolved.lower().endswith(".m3u8") or ".m3u8?" in resolved.lower():
                         return f'URI="{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}"'
 
-                    # Otherwise (e.g. subtitle .vtt URI) → direct
                     return f'URI="{resolved}"'
 
                 line = re.sub(r'URI="(.*?)"', _rewrite_uri, line)
@@ -219,21 +198,21 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
             lines.append(line)
 
         elif next_is_variant:
-            # URL line following #EXT-X-STREAM-INF — must be a variant playlist
             next_is_variant = False
             resolved = resolve(line)
             lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
 
         else:
-            # Segment line (or any other non-tag URL line).
-            # If it ends in .m3u8 it's an inline variant reference without a preceding tag
-            # (rare, but handle it). Otherwise it's a segment → direct CDN URL.
             next_is_variant = False
             resolved = resolve(line)
+
             if resolved.lower().endswith(".m3u8") or ".m3u8?" in resolved.lower():
                 lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
             else:
-                # Direct CDN — player fetches .ts with no proxy overhead
+                seg_path = urlparse(resolved).path.lower()
+                has_ext  = any(seg_path.endswith(ext) for ext in (".ts", ".aac", ".mp3", ".vtt", ".mp4", ".m4s"))
+                if not has_ext:
+                    resolved = resolved + ".ts"
                 lines.append(resolved)
 
     return "\n".join(lines)
