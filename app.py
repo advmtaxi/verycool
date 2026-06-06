@@ -78,7 +78,10 @@ def _fetch_text(embed_url: str, url: str) -> str | None:
         logger.warning(f"[FETCH TEXT] No cached session for {embed_url[:80]}")
         return None
     try:
-        r = entry["session"].get(url, timeout=10)
+        parsed_embed = urlparse(embed_url)
+        origin       = f"{parsed_embed.scheme}://{parsed_embed.netloc}"
+        headers      = {"Referer": embed_url, "Origin": origin}
+        r = entry["session"].get(url, headers=headers, timeout=10)
         logger.info(f"[FETCH TEXT] {r.status_code} {url[:80]}")
         r.raise_for_status()
         return r.text
@@ -92,7 +95,10 @@ def _fetch_binary(embed_url: str, url: str) -> bytes | None:
     if not entry:
         return None
     try:
-        r = entry["session"].get(url, timeout=10)
+        parsed_embed = urlparse(embed_url)
+        origin       = f"{parsed_embed.scheme}://{parsed_embed.netloc}"
+        headers      = {"Referer": embed_url, "Origin": origin}
+        r = entry["session"].get(url, headers=headers, timeout=10)
         r.raise_for_status()
         return r.content
     except Exception as e:
@@ -275,7 +281,13 @@ def proxy():
 
         _touch(embed_url)
         try:
-            r = entry["session"].get(variant_url, timeout=15)
+            parsed_embed = urlparse(embed_url)
+            origin       = f"{parsed_embed.scheme}://{parsed_embed.netloc}"
+            headers      = {
+                "Referer": embed_url,
+                "Origin":  origin,
+            }
+            r = entry["session"].get(variant_url, headers=headers, timeout=15)
             logger.info(f"[VARIANT] {r.status_code} {variant_url[:80]}")
             return Response(
                 r.content,
