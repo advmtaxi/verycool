@@ -36,8 +36,8 @@ print("New App.py Loaded v7 - HD Priority & Robust Sniffer")
 # ── Config ───────────────────────────────────────────────────────────────────
 PORT         = int(os.environ.get("PORT", 7860))
 IDLE_TIMEOUT = 600
-REFERERS     = ["https://embedsports.top/", "https://streamed.pk/"]
-ORIGINS      = ["https://embedsports.top", "https://streamed.pk"]
+REFERERS     = ["https://embedindia.st/", "https://ppv.to/"]
+ORIGINS      = ["https://embedindia.st", "https://ppv.to"]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
