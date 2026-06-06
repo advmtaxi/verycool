@@ -173,7 +173,7 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
             continue
 
         if line.startswith("#EXT-X-PLAYLIST-TYPE"):
-            lines.append(line)  # pass through as-is
+            lines.append(line)
             continue
 
         if line.startswith("#"):
@@ -203,17 +203,9 @@ def _rewrite_m3u8(content: str, base_url: str, embed_key: str, proxy_host: str) 
             lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
 
         else:
+            # Segment — serve directly as-is
             next_is_variant = False
-            resolved = resolve(line)
-
-            if resolved.lower().endswith(".m3u8") or ".m3u8?" in resolved.lower():
-                lines.append(f"{proxy_host}/proxy?link={quote(embed_key)}&_variant={quote(resolved)}")
-            else:
-                seg_path = urlparse(resolved).path.lower()
-                has_ext  = any(seg_path.endswith(ext) for ext in (".ts", ".aac", ".mp3", ".vtt", ".mp4", ".m4s"))
-                if not has_ext:
-                    resolved = resolved + ".ts"
-                lines.append(resolved)
+            lines.append(resolve(line))
 
     return "\n".join(lines)
 # =============================================================================
