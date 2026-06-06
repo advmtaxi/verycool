@@ -258,32 +258,34 @@ def proxy():
         return Response("Key fetch failed", status=503)
 
     # ── Variant / chunklist playlist ─────────────────────────────────────────
-    # Fetch with captured session headers, stream response raw to player as-is.
-    # _rewrite_m3u8 is NOT called here — segments inside are direct CDN URLs.
+    # Fetch with captured session headers, return raw to player as-is.
     if variant_url:
-        _touch(embed_url)
         entry = _get_cached(embed_url)
         if not entry:
-            return Response("Session expired", status=503)
+            logger.warning(f"[VARIANT] No session for {embed_url[:60]} — re-sniffing")
+            _ensure_sniffer(embed_url)
+            for _ in range(50):
+                time.sleep(0.5)
+                entry = _get_cached(embed_url)
+                if entry:
+                    break
 
+        if not entry:
+            return Response("Session not found", status=503)
+
+        _touch(embed_url)
         try:
-            r = entry["session"].get(variant_url, stream=True, timeout=10)
+            r = entry["session"].get(variant_url, timeout=15)
             logger.info(f"[VARIANT] {r.status_code} {variant_url[:80]}")
-
-            def generate():
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        yield chunk
-
             return Response(
-                generate(),
+                r.content,
                 status=r.status_code,
                 content_type=r.headers.get("Content-Type", "application/vnd.apple.mpegurl"),
                 headers={"Cache-Control": "no-cache, no-store"},
             )
         except Exception as e:
             logger.error(f"[VARIANT] Fetch error: {e}")
-            return Response("Variant fetch failed", status=503)
+            return Response(f"Variant fetch error: {e}", status=503)
 
     # ── Master playlist ───────────────────────────────────────────────────────
     cached = _get_cached(embed_url)
